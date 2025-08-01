@@ -1,78 +1,65 @@
 #!/usr/bin/env python3
 """
-MCP Server for Airtable Integration
+MCP Server for Airtable Integration (Refactored)
 Exposes Airtable operations as MCP tools for LLM integration
+
+Now supports both stdio (legacy) and HTTP modes for better performance
+Refactored for modularity and maintainability
 """
 
 import asyncio
-import os
 import logging
-from typing import Any, Dict, List, Optional
-import json
+from typing import Any, Dict, List
 
-import httpx
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
-from pydantic import BaseModel
 
-# Load environment variables
-load_dotenv()
+# Import configuration and handlers
+from .config import (
+    MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_MODE, MCP_SERVER_PORT,
+    AIRTABLE_GATEWAY_URL, CORS_ORIGINS, SECURE_CONFIG_AVAILABLE,
+    gateway, cleanup_config
+)
+from .models import ToolCallRequest, ToolCallResponse, ToolListResponse
+from .handlers import (
+    handle_list_tables, handle_get_records, handle_get_field_info,
+    handle_create_record, handle_update_record, handle_delete_record,
+    handle_batch_create_records, handle_batch_update_records,
+    handle_analyze_table_data, handle_find_duplicates,
+    handle_search_records, handle_create_metadata_table,
+    handle_export_table_csv, handle_sync_tables
+)
 
-# Configure logging
-logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
+if SECURE_CONFIG_AVAILABLE:
+    from pyairtable_common.middleware import setup_security_middleware
+
 logger = logging.getLogger(__name__)
 
-# Configuration
-AIRTABLE_GATEWAY_URL = os.getenv("AIRTABLE_GATEWAY_URL", "http://localhost:8002")
-AIRTABLE_GATEWAY_API_KEY = os.getenv("AIRTABLE_GATEWAY_API_KEY", "simple-api-key")
-MCP_SERVER_NAME = os.getenv("MCP_SERVER_NAME", "airtable-mcp")
-MCP_SERVER_VERSION = os.getenv("MCP_SERVER_VERSION", "1.0.0")
-
-
-class AirtableGatewayClient:
-    """HTTP client for communicating with the Airtable Gateway service"""
-    
-    def __init__(self, base_url: str, api_key: str):
-        self.base_url = base_url.rstrip("/")
-        self.headers = {"X-API-Key": api_key}
-        self.client = httpx.AsyncClient(timeout=30.0)
-    
-    async def get(self, endpoint: str, **params) -> Dict[str, Any]:
-        """Make GET request to gateway"""
-        url = f"{self.base_url}{endpoint}"
-        response = await self.client.get(url, headers=self.headers, params=params)
-        response.raise_for_status()
-        return response.json()
-    
-    async def post(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Make POST request to gateway"""
-        url = f"{self.base_url}{endpoint}"
-        response = await self.client.post(url, headers=self.headers, json=data)
-        response.raise_for_status()
-        return response.json()
-    
-    async def patch(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Make PATCH request to gateway"""
-        url = f"{self.base_url}{endpoint}"
-        response = await self.client.patch(url, headers=self.headers, json=data)
-        response.raise_for_status()
-        return response.json()
-    
-    async def delete(self, endpoint: str) -> Dict[str, Any]:
-        """Make DELETE request to gateway"""
-        url = f"{self.base_url}{endpoint}"
-        response = await self.client.delete(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
-
-
-# Initialize gateway client
-gateway = AirtableGatewayClient(AIRTABLE_GATEWAY_URL, AIRTABLE_GATEWAY_API_KEY)
-
-# Initialize MCP server
+# Initialize MCP server (for stdio mode)
 server = Server(MCP_SERVER_NAME)
+
+# Initialize FastAPI app for HTTP mode
+http_app = FastAPI(
+    title="MCP Server HTTP API",
+    description="HTTP API for MCP tools (replaces stdio for better performance)",
+    version=MCP_SERVER_VERSION
+)
+
+# Add CORS middleware for HTTP mode with security hardening
+http_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+)
+
+# Add security middleware for HTTP mode
+if SECURE_CONFIG_AVAILABLE:
+    setup_security_middleware(http_app, rate_limit_calls=100, rate_limit_period=60)
 
 
 @server.list_tools()
@@ -85,10 +72,7 @@ async def list_tools() -> List[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "base_id": {
-                        "type": "string",
-                        "description": "Airtable base ID (e.g., appXXXXXXXXXXXXXX)"
-                    }
+                    "base_id": {"type": "string", "description": "Airtable base ID (e.g., appXXXXXXXXXXXXXX)"}
                 },
                 "required": ["base_id"]
             }
@@ -99,175 +83,57 @@ async def list_tools() -> List[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "base_id": {
-                        "type": "string",
-                        "description": "Airtable base ID"
-                    },
-                    "table_id": {
-                        "type": "string",
-                        "description": "Table ID or name"
-                    },
-                    "max_records": {
-                        "type": "integer",
-                        "description": "Maximum number of records to return (default: 100)",
-                        "default": 100
-                    },
-                    "view": {
-                        "type": "string",
-                        "description": "View name or ID to filter by"
-                    },
-                    "filter_by_formula": {
-                        "type": "string",
-                        "description": "Airtable formula to filter records"
-                    }
+                    "base_id": {"type": "string", "description": "Airtable base ID"},
+                    "table_id": {"type": "string", "description": "Table ID or name"},
+                    "max_records": {"type": "integer", "description": "Maximum number of records to return (default: 100)", "default": 100},
+                    "view": {"type": "string", "description": "View name or ID to filter by"},
+                    "filter_by_formula": {"type": "string", "description": "Airtable formula to filter records"}
                 },
                 "required": ["base_id", "table_id"]
             }
         ),
-        Tool(
-            name="create_record",
-            description="Create a new record in an Airtable table",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "base_id": {
-                        "type": "string",
-                        "description": "Airtable base ID"
-                    },
-                    "table_id": {
-                        "type": "string",
-                        "description": "Table ID or name"
-                    },
-                    "fields": {
-                        "type": "object",
-                        "description": "Field values for the new record"
-                    }
-                },
-                "required": ["base_id", "table_id", "fields"]
-            }
-        ),
-        Tool(
-            name="update_record",
-            description="Update an existing record in an Airtable table",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "base_id": {
-                        "type": "string",
-                        "description": "Airtable base ID"
-                    },
-                    "table_id": {
-                        "type": "string",
-                        "description": "Table ID or name"
-                    },
-                    "record_id": {
-                        "type": "string",
-                        "description": "Record ID to update"
-                    },
-                    "fields": {
-                        "type": "object",
-                        "description": "Field values to update"
-                    }
-                },
-                "required": ["base_id", "table_id", "record_id", "fields"]
-            }
-        ),
-        Tool(
-            name="delete_record",
-            description="Delete a record from an Airtable table",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "base_id": {
-                        "type": "string",
-                        "description": "Airtable base ID"
-                    },
-                    "table_id": {
-                        "type": "string",
-                        "description": "Table ID or name"
-                    },
-                    "record_id": {
-                        "type": "string",
-                        "description": "Record ID to delete"
-                    }
-                },
-                "required": ["base_id", "table_id", "record_id"]
-            }
-        ),
-        Tool(
-            name="search_records",
-            description="Search records in an Airtable table with advanced filtering",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "base_id": {
-                        "type": "string",
-                        "description": "Airtable base ID"
-                    },
-                    "table_id": {
-                        "type": "string",
-                        "description": "Table ID or name"
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Search query text"
-                    },
-                    "fields": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Specific fields to search in"
-                    },
-                    "max_records": {
-                        "type": "integer",
-                        "description": "Maximum number of records to return",
-                        "default": 50
-                    }
-                },
-                "required": ["base_id", "table_id", "query"]
-            }
-        ),
-        Tool(
-            name="create_metadata_table",
-            description="Create a table containing metadata about all tables in a base",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "base_id": {
-                        "type": "string",
-                        "description": "Airtable base ID to analyze"
-                    },
-                    "table_name": {
-                        "type": "string",
-                        "description": "Name for the metadata table",
-                        "default": "Table Metadata"
-                    }
-                },
-                "required": ["base_id"]
-            }
-        )
+        Tool(name="create_record", description="Create a new record in an Airtable table", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "fields": {"type": "object", "description": "Field values for the new record"}}, "required": ["base_id", "table_id", "fields"]}),
+        Tool(name="update_record", description="Update an existing record in an Airtable table", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "record_id": {"type": "string", "description": "Record ID to update"}, "fields": {"type": "object", "description": "Field values to update"}}, "required": ["base_id", "table_id", "record_id", "fields"]}),
+        Tool(name="delete_record", description="Delete a record from an Airtable table", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "record_id": {"type": "string", "description": "Record ID to delete"}}, "required": ["base_id", "table_id", "record_id"]}),
+        Tool(name="search_records", description="Search records in an Airtable table with advanced filtering", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "query": {"type": "string", "description": "Search query text"}, "fields": {"type": "array", "items": {"type": "string"}, "description": "Specific fields to search in"}, "max_records": {"type": "integer", "description": "Maximum number of records to return", "default": 50}}, "required": ["base_id", "table_id", "query"]}),
+        Tool(name="create_metadata_table", description="Create a table containing metadata about all tables in a base", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID to analyze"}, "table_name": {"type": "string", "description": "Name for the metadata table", "default": "Table Metadata"}}, "required": ["base_id"]}),
+        Tool(name="batch_create_records", description="Create multiple records in a single operation (efficient for bulk data)", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "records": {"type": "array", "items": {"type": "object", "description": "Record fields object"}, "description": "Array of record objects to create"}}, "required": ["base_id", "table_id", "records"]}),
+        Tool(name="batch_update_records", description="Update multiple records in a single operation", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "records": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "fields": {"type": "object"}}, "required": ["id", "fields"]}, "description": "Array of records with IDs and fields to update"}}, "required": ["base_id", "table_id", "records"]}),
+        Tool(name="get_field_info", description="Get detailed information about fields in a table", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}}, "required": ["base_id", "table_id"]}),
+        Tool(name="analyze_table_data", description="Analyze table data to show statistics, patterns, and data quality insights", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "sample_size": {"type": "integer", "description": "Number of records to analyze (default: 100)", "default": 100}}, "required": ["base_id", "table_id"]}),
+        Tool(name="find_duplicates", description="Find duplicate records in a table based on specified fields", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "fields": {"type": "array", "items": {"type": "string"}, "description": "Field names to check for duplicates"}, "ignore_empty": {"type": "boolean", "description": "Whether to ignore empty values when checking duplicates", "default": True}}, "required": ["base_id", "table_id", "fields"]}),
+        Tool(name="export_table_csv", description="Export table data to CSV format (useful for data analysis)", inputSchema={"type": "object", "properties": {"base_id": {"type": "string", "description": "Airtable base ID"}, "table_id": {"type": "string", "description": "Table ID or name"}, "fields": {"type": "array", "items": {"type": "string"}, "description": "Specific fields to export (optional - all fields if not specified)"}, "view": {"type": "string", "description": "View name or ID to export"}, "max_records": {"type": "integer", "description": "Maximum number of records to export", "default": 1000}}, "required": ["base_id", "table_id"]}),
+        Tool(name="sync_tables", description="Compare and sync data between two tables (useful for data migration/backup)", inputSchema={"type": "object", "properties": {"source_base_id": {"type": "string", "description": "Source base ID"}, "source_table_id": {"type": "string", "description": "Source table ID"}, "target_base_id": {"type": "string", "description": "Target base ID"}, "target_table_id": {"type": "string", "description": "Target table ID"}, "key_field": {"type": "string", "description": "Field name to use as unique identifier for syncing"}, "dry_run": {"type": "boolean", "description": "If true, only show what would be synced without making changes", "default": True}}, "required": ["source_base_id", "source_table_id", "target_base_id", "target_table_id", "key_field"]})
     ]
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle tool execution"""
+    """Handle tool execution - delegates to appropriate handler"""
     logger.info(f"Executing tool: {name} with arguments: {arguments}")
     
     try:
-        if name == "list_tables":
-            return await handle_list_tables(arguments)
-        elif name == "get_records":
-            return await handle_get_records(arguments)
-        elif name == "create_record":
-            return await handle_create_record(arguments)
-        elif name == "update_record":
-            return await handle_update_record(arguments)
-        elif name == "delete_record":
-            return await handle_delete_record(arguments)
-        elif name == "search_records":
-            return await handle_search_records(arguments)
-        elif name == "create_metadata_table":
-            return await handle_create_metadata_table(arguments)
+        # Route to appropriate handler
+        handler_map = {
+            "list_tables": handle_list_tables,
+            "get_records": handle_get_records,
+            "get_field_info": handle_get_field_info,
+            "create_record": handle_create_record,
+            "update_record": handle_update_record,
+            "delete_record": handle_delete_record,
+            "batch_create_records": handle_batch_create_records,
+            "batch_update_records": handle_batch_update_records,
+            "analyze_table_data": handle_analyze_table_data,
+            "find_duplicates": handle_find_duplicates,
+            "search_records": handle_search_records,
+            "create_metadata_table": handle_create_metadata_table,
+            "export_table_csv": handle_export_table_csv,
+            "sync_tables": handle_sync_tables
+        }
+        
+        handler = handler_map.get(name)
+        if handler:
+            return await handler(arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     
@@ -276,200 +142,47 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
-async def handle_list_tables(arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle list_tables tool"""
-    base_id = arguments["base_id"]
-    
-    result = await gateway.get(f"/bases/{base_id}/schema")
-    tables = result.get("tables", [])
-    
-    # Format table information
-    table_info = []
-    for table in tables:
-        table_info.append({
-            "id": table["id"],
-            "name": table["name"],
-            "description": table.get("description", ""),
-            "field_count": len(table.get("fields", [])),
-            "view_count": len(table.get("views", []))
-        })
-    
-    response = {
-        "base_id": base_id,
-        "table_count": len(tables),
-        "tables": table_info
-    }
-    
-    return [TextContent(type="text", text=json.dumps(response, indent=2))]
+# HTTP Endpoints for performance optimization
+@http_app.get("/health")
+async def http_health_check():
+    """Health check for HTTP mode"""
+    return {"status": "healthy", "service": "mcp-server-http", "version": MCP_SERVER_VERSION}
 
 
-async def handle_get_records(arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle get_records tool"""
-    base_id = arguments["base_id"]
-    table_id = arguments["table_id"]
-    
-    params = {}
-    if "max_records" in arguments:
-        params["max_records"] = arguments["max_records"]
-    if "view" in arguments:
-        params["view"] = arguments["view"]
-    if "filter_by_formula" in arguments:
-        params["filter_by_formula"] = arguments["filter_by_formula"]
-    
-    result = await gateway.get(f"/bases/{base_id}/tables/{table_id}/records", **params)
-    
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+@http_app.get("/tools", response_model=ToolListResponse)
+async def http_list_tools():
+    """HTTP endpoint to list available tools"""
+    try:
+        tools = await list_tools()
+        return ToolListResponse(tools=tools)
+    except Exception as e:
+        logger.error(f"Error listing tools via HTTP: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-async def handle_create_record(arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle create_record tool"""
-    base_id = arguments["base_id"]
-    table_id = arguments["table_id"]
-    fields = arguments["fields"]
-    
-    result = await gateway.post(f"/bases/{base_id}/tables/{table_id}/records", fields)
-    
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-
-async def handle_update_record(arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle update_record tool"""
-    base_id = arguments["base_id"]
-    table_id = arguments["table_id"]
-    record_id = arguments["record_id"]
-    fields = arguments["fields"]
-    
-    result = await gateway.patch(f"/bases/{base_id}/tables/{table_id}/records/{record_id}", fields)
-    
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-
-async def handle_delete_record(arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle delete_record tool"""
-    base_id = arguments["base_id"]
-    table_id = arguments["table_id"]
-    record_id = arguments["record_id"]
-    
-    result = await gateway.delete(f"/bases/{base_id}/tables/{table_id}/records/{record_id}")
-    
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-
-async def handle_search_records(arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle search_records tool"""
-    base_id = arguments["base_id"]
-    table_id = arguments["table_id"]
-    query = arguments["query"]
-    fields = arguments.get("fields", [])
-    max_records = arguments.get("max_records", 50)
-    
-    # Build filter formula for search
-    if fields:
-        # Search in specific fields
-        conditions = []
-        for field in fields:
-            conditions.append(f"FIND(LOWER('{query}'), LOWER({{{field}}})) > 0")
-        filter_formula = f"OR({', '.join(conditions)})"
-    else:
-        # Generic search across all text fields
-        filter_formula = f"SEARCH(LOWER('{query}'), LOWER(CONCATENATE(VALUES())))"
-    
-    params = {
-        "filter_by_formula": filter_formula,
-        "max_records": max_records
-    }
-    
-    result = await gateway.get(f"/bases/{base_id}/tables/{table_id}/records", **params)
-    
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-
-async def handle_create_metadata_table(arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle create_metadata_table tool - analyzes base and creates metadata table"""
-    base_id = arguments["base_id"]
-    table_name = arguments.get("table_name", "Table Metadata")
-    
-    # First get the base schema
-    schema_result = await gateway.get(f"/bases/{base_id}/schema")
-    tables = schema_result.get("tables", [])
-    
-    # Prepare metadata records
-    metadata_records = []
-    for table in tables:
-        fields = table.get("fields", [])
+@http_app.post("/tools/call", response_model=ToolCallResponse)
+async def http_call_tool(request: ToolCallRequest):
+    """HTTP endpoint to call a tool (replaces subprocess stdio)"""
+    try:
+        logger.info(f"HTTP tool call: {request.name} with args: {request.arguments}")
         
-        # Analyze field types
-        field_types = {}
-        for field in fields:
-            field_type = field.get("type", "unknown")
-            field_types[field_type] = field_types.get(field_type, 0) + 1
+        # Use the same tool calling logic as stdio mode
+        result = await call_tool(request.name, request.arguments)
         
-        # Create metadata record
-        metadata_record = {
-            "Table Name": table["name"],
-            "Table ID": table["id"],
-            "Description": table.get("description", ""),
-            "Field Count": len(fields),
-            "View Count": len(table.get("views", [])),
-            "Field Types": ", ".join([f"{k}: {v}" for k, v in field_types.items()]),
-            "Primary Fields": ", ".join([f["name"] for f in fields[:3]]),  # First 3 fields
-            "Created Date": "",  # Would need additional API call to get creation date
-            "Purpose": _infer_table_purpose(table["name"], fields)
-        }
-        metadata_records.append(metadata_record)
-    
-    # Create the metadata table
-    # Note: This would require creating a new table via Airtable API
-    # For now, we'll return the metadata as structured data
-    
-    result = {
-        "message": f"Metadata analysis complete for base {base_id}",
-        "suggested_table_name": table_name,
-        "metadata_records": metadata_records,
-        "summary": {
-            "total_tables": len(tables),
-            "total_fields": sum(len(t.get("fields", [])) for t in tables),
-            "table_types": _categorize_tables(tables)
-        }
-    }
-    
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-
-def _infer_table_purpose(table_name: str, fields: List[Dict[str, Any]]) -> str:
-    """Infer the purpose of a table based on its name and fields"""
-    name_lower = table_name.lower()
-    field_names = [f.get("name", "").lower() for f in fields]
-    
-    # Common patterns
-    if any(word in name_lower for word in ["project", "task", "todo"]):
-        return "Project/Task Management"
-    elif any(word in name_lower for word in ["contact", "people", "user", "client"]):
-        return "Contact/People Management"
-    elif any(word in name_lower for word in ["product", "inventory", "item"]):
-        return "Product/Inventory Tracking"
-    elif any(word in name_lower for word in ["event", "calendar", "schedule"]):
-        return "Event/Schedule Management"
-    elif any(word in field_names for word in ["email", "phone", "address"]):
-        return "Contact Information"
-    elif any(word in field_names for word in ["price", "cost", "amount", "budget"]):
-        return "Financial/Budget Tracking"
-    else:
-        return "General Data Storage"
-
-
-def _categorize_tables(tables: List[Dict[str, Any]]) -> Dict[str, int]:
-    """Categorize tables by their inferred purpose"""
-    categories = {}
-    for table in tables:
-        purpose = _infer_table_purpose(table["name"], table.get("fields", []))
-        categories[purpose] = categories.get(purpose, 0) + 1
-    return categories
+        return ToolCallResponse(result=result, success=True)
+    except Exception as e:
+        logger.error(f"Error calling tool {request.name} via HTTP: {e}")
+        return ToolCallResponse(
+            result=[TextContent(type="text", text=f"Error: {str(e)}")],
+            success=False,
+            error=str(e)
+        )
 
 
 async def main():
     """Main function to start the MCP server"""
     logger.info(f"Starting MCP Server: {MCP_SERVER_NAME} v{MCP_SERVER_VERSION}")
+    logger.info(f"Mode: {MCP_SERVER_MODE}")
     logger.info(f"Connecting to Airtable Gateway at: {AIRTABLE_GATEWAY_URL}")
     
     # Test gateway connection
@@ -479,10 +192,36 @@ async def main():
     except Exception as e:
         logger.warning(f"⚠️  Could not connect to Airtable Gateway: {e}")
     
-    # Start MCP server with stdio transport
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    try:
+        if MCP_SERVER_MODE == "http":
+            # Start HTTP server for better performance
+            import uvicorn
+            logger.info(f"🚀 Starting MCP Server in HTTP mode on port {MCP_SERVER_PORT}")
+            config = uvicorn.Config(http_app, host="0.0.0.0", port=MCP_SERVER_PORT, log_level="info")
+            server_instance = uvicorn.Server(config)
+            await server_instance.serve()
+        else:
+            # Start MCP server with stdio transport (legacy mode)
+            logger.info("🚀 Starting MCP Server in stdio mode")
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        # Cleanup configuration
+        await cleanup_config()
+
+
+async def main_http():
+    """Entry point for HTTP mode"""
+    import os
+    os.environ["MCP_SERVER_MODE"] = "http"
+    await main()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--http":
+        # Start in HTTP mode
+        asyncio.run(main_http())
+    else:
+        # Default stdio mode for backward compatibility
+        asyncio.run(main())
