@@ -11,7 +11,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -54,8 +54,39 @@ http_app.add_middleware(
     allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Trace-ID"],
 )
+
+# Custom middleware for distributed tracing
+import uuid
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response
+
+class DistributedTracingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        # Extract trace ID from incoming request or generate new one
+        trace_id = request.headers.get("X-Trace-ID") or str(uuid.uuid4())
+        
+        # Add trace ID to request state for use in handlers
+        request.state.trace_id = trace_id
+        
+        # Log request start with trace ID
+        logger.info(f"[TRACE:{trace_id}] MCP Server request: {request.method} {request.url.path}")
+        
+        # Process request
+        response = await call_next(request)
+        
+        # Add trace ID to response headers
+        response.headers["X-Trace-ID"] = trace_id
+        
+        # Log request completion
+        logger.info(f"[TRACE:{trace_id}] MCP Server response: {response.status_code}")
+        
+        return response
+
+# Add distributed tracing middleware
+http_app.add_middleware(DistributedTracingMiddleware)
 
 # Add security middleware for HTTP mode
 if SECURE_CONFIG_AVAILABLE:
@@ -142,6 +173,51 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
+async def call_tool_with_trace(name: str, arguments: Dict[str, Any], trace_id: str = None) -> List[TextContent]:
+    """Handle tool execution with trace ID support"""
+    if trace_id:
+        logger.info(f"[TRACE:{trace_id}] Executing tool: {name} with arguments: {arguments}")
+    else:
+        logger.info(f"Executing tool: {name} with arguments: {arguments}")
+    
+    try:
+        # Route to appropriate handler
+        handler_map = {
+            "list_tables": handle_list_tables,
+            "get_records": handle_get_records,
+            "get_field_info": handle_get_field_info,
+            "create_record": handle_create_record,
+            "update_record": handle_update_record,
+            "delete_record": handle_delete_record,
+            "batch_create_records": handle_batch_create_records,
+            "batch_update_records": handle_batch_update_records,
+            "analyze_table_data": handle_analyze_table_data,
+            "find_duplicates": handle_find_duplicates,
+            "search_records": handle_search_records,
+            "create_metadata_table": handle_create_metadata_table,
+            "export_table_csv": handle_export_table_csv,
+            "sync_tables": handle_sync_tables
+        }
+        
+        handler = handler_map.get(name)
+        if handler:
+            # Pass trace_id to handlers that support it
+            import inspect
+            if 'trace_id' in inspect.signature(handler).parameters:
+                return await handler(arguments, trace_id=trace_id)
+            else:
+                return await handler(arguments)
+        else:
+            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+    
+    except Exception as e:
+        if trace_id:
+            logger.error(f"[TRACE:{trace_id}] Error executing tool {name}: {e}")
+        else:
+            logger.error(f"Error executing tool {name}: {e}")
+        return [TextContent(type="text", text=f"Error: {str(e)}")]
+
+
 # HTTP Endpoints for performance optimization
 @http_app.get("/health")
 async def http_health_check():
@@ -161,17 +237,26 @@ async def http_list_tools():
 
 
 @http_app.post("/tools/call", response_model=ToolCallResponse)
-async def http_call_tool(request: ToolCallRequest):
+async def http_call_tool(request: ToolCallRequest, http_request: Request):
     """HTTP endpoint to call a tool (replaces subprocess stdio)"""
     try:
-        logger.info(f"HTTP tool call: {request.name} with args: {request.arguments}")
+        # Get trace ID from request state
+        trace_id = getattr(http_request.state, 'trace_id', None)
         
-        # Use the same tool calling logic as stdio mode
-        result = await call_tool(request.name, request.arguments)
+        if trace_id:
+            logger.info(f"[TRACE:{trace_id}] HTTP tool call: {request.name} with args: {request.arguments}")
+        else:
+            logger.info(f"HTTP tool call: {request.name} with args: {request.arguments}")
+        
+        # Use the same tool calling logic as stdio mode, but pass trace_id to handlers
+        result = await call_tool_with_trace(request.name, request.arguments, trace_id)
         
         return ToolCallResponse(result=result, success=True)
     except Exception as e:
-        logger.error(f"Error calling tool {request.name} via HTTP: {e}")
+        if trace_id:
+            logger.error(f"[TRACE:{trace_id}] Error calling tool {request.name} via HTTP: {e}")
+        else:
+            logger.error(f"Error calling tool {request.name} via HTTP: {e}")
         return ToolCallResponse(
             result=[TextContent(type="text", text=f"Error: {str(e)}")],
             success=False,
